@@ -2,21 +2,21 @@ import os
 import logging
 import re
 import threading
+import urllib.request
+import urllib.parse
+import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from groq import Groq
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GMAIL_USER = os.environ["GMAIL_USER"]
-GMAIL_PASSWORD = os.environ["GMAIL_PASSWORD"]
+GMAIL_FROM = os.environ["GMAIL_FROM"]
+SENDGRID_API_KEY = os.environ["SENDGRID_API_KEY"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 PORT = int(os.environ.get("PORT", 8080))
 
@@ -45,7 +45,7 @@ ASUNTO: [asunto aquí]
 CUERPO:
 [cuerpo del mail aquí, terminando con "Nassim"]"""
 
-client = Groq(api_key=GROQ_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -63,6 +63,28 @@ def run_health_server():
     server.serve_forever()
 
 
+def enviar_sendgrid(destinatario, asunto, cuerpo):
+    cuerpo_completo = cuerpo + "\n\n--\n" + FIRMA
+    payload = json.dumps({
+        "personalizations": [{"to": [{"email": destinatario}]}],
+        "from": {"email": GMAIL_FROM, "name": "Nassim Hid"},
+        "subject": asunto,
+        "content": [{"type": "text/plain", "value": cuerpo_completo}]
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req) as resp:
+        return resp.status
+
+
 def generar_mail(nombre, email, empresa, rubro, notas, tono="creativo"):
     prompt = f"""Redactá un mail de prospección con estos datos:
 - Nombre: {nombre}
@@ -72,7 +94,7 @@ def generar_mail(nombre, email, empresa, rubro, notas, tono="creativo"):
 - Notas: {notas or 'ninguna'}
 - Tono solicitado: {tono}"""
 
-    response = client.chat.completions.create(
+    response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         max_tokens=1000,
         messages=[
@@ -83,32 +105,15 @@ def generar_mail(nombre, email, empresa, rubro, notas, tono="creativo"):
     return response.choices[0].message.content
 
 
-def enviar_gmail(destinatario, asunto, cuerpo):
-    msg = MIMEMultipart()
-    msg["From"] = GMAIL_USER
-    msg["To"] = destinatario
-    msg["Subject"] = asunto
-
-    cuerpo_completo = cuerpo + "\n\n--\n" + FIRMA
-    msg.attach(MIMEText(cuerpo_completo, "plain", "utf-8"))
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(GMAIL_USER, GMAIL_PASSWORD)
-        server.sendmail(GMAIL_USER, destinatario, msg.as_string())
-
-
 def parsear_mail(texto):
     asunto = ""
     cuerpo = ""
-
     asunto_match = re.search(r"ASUNTO:\s*(.+)", texto)
     if asunto_match:
         asunto = asunto_match.group(1).strip()
-
     cuerpo_match = re.search(r"CUERPO:\s*\n([\s\S]+)", texto)
     if cuerpo_match:
         cuerpo = cuerpo_match.group(1).strip()
-
     return asunto, cuerpo
 
 
@@ -125,39 +130,16 @@ def parsear_plantilla(texto):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         return
+    await update.message.reply_text("""¡Hola Nassim! Listo para enviar mails.
 
-    plantilla = """¡Hola Nassim! Listo para enviar mails.
-
-Usá esta plantilla para cada contacto:
+Usá esta plantilla:
 
 NOMBRE: [nombre completo]
 MAIL: [email del contacto]
 EMPRESA: [empresa, opcional]
 RUBRO: [rubro o industria]
 NOTAS: [detalles para personalizar]
-TONO: [creativo / formal, opcional]
-
-Te genero el mail y te lo muestro antes de enviarlo."""
-
-    await update.message.reply_text(plantilla)
-
-
-async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return
-
-    texto = """Comandos disponibles:
-
-/start — Muestra la plantilla
-/ayuda — Esta ayuda
-
-Para enviar un mail, mandame un mensaje con el formato:
-NOMBRE: Juan
-MAIL: juan@gym.com
-RUBRO: Fitness
-NOTAS: tiene un gym en Tucumán"""
-
-    await update.message.reply_text(texto)
+TONO: [creativo / formal, opcional]""")
 
 
 async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -171,32 +153,23 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pendiente = context.user_data["mail_pendiente"]
             try:
                 await update.message.reply_text("Enviando...")
-                enviar_gmail(
-                    pendiente["email"],
-                    pendiente["asunto"],
-                    pendiente["cuerpo"]
-                )
-                await update.message.reply_text(
-                    f"Mail enviado a {pendiente['nombre']} ({pendiente['email']})"
-                )
+                enviar_sendgrid(pendiente["email"], pendiente["asunto"], pendiente["cuerpo"])
+                await update.message.reply_text(f"Mail enviado a {pendiente['nombre']} ({pendiente['email']})")
                 context.user_data.pop("mail_pendiente")
             except Exception as e:
                 await update.message.reply_text(f"Error al enviar: {str(e)}")
         else:
-            await update.message.reply_text("No hay ningún mail pendiente. Mandame los datos del contacto.")
+            await update.message.reply_text("No hay ningún mail pendiente.")
         return
 
-    if texto.lower() in ["no", "cancelar", "cancel"]:
+    if texto.lower() in ["no", "cancelar"]:
         context.user_data.pop("mail_pendiente", None)
-        await update.message.reply_text("Cancelado. Mandame los datos de otro contacto cuando quieras.")
+        await update.message.reply_text("Cancelado.")
         return
 
     campos = parsear_plantilla(texto)
-
     if not campos.get("NOMBRE") or not campos.get("MAIL"):
-        await update.message.reply_text(
-            "Necesito al menos NOMBRE y MAIL. Usá el formato:\n\nNOMBRE: Juan\nMAIL: juan@empresa.com\nRUBRO: Fitness\nNOTAS: ..."
-        )
+        await update.message.reply_text("Necesito al menos NOMBRE y MAIL.")
         return
 
     await update.message.reply_text(f"Generando mail para {campos['NOMBRE']}...")
@@ -210,19 +183,16 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             notas=campos.get("NOTAS", ""),
             tono=campos.get("TONO", "creativo")
         )
-
         asunto, cuerpo = parsear_mail(mail_generado)
-
         context.user_data["mail_pendiente"] = {
             "nombre": campos["NOMBRE"],
             "email": campos["MAIL"],
             "asunto": asunto,
             "cuerpo": cuerpo
         }
+        await update.message.reply_text(f"""Borrador listo:
 
-        preview = f"""Borrador listo:
-
-De: nassimhidfilm@gmail.com
+De: {GMAIL_FROM}
 Para: {campos['MAIL']}
 Asunto: {asunto}
 
@@ -232,10 +202,7 @@ Asunto: {asunto}
 {FIRMA}
 
 ---
-Respondé SI para enviar o NO para cancelar."""
-
-        await update.message.reply_text(preview)
-
+Respondé SI para enviar o NO para cancelar.""")
     except Exception as e:
         await update.message.reply_text(f"Error generando el mail: {str(e)}")
 
@@ -243,11 +210,8 @@ Respondé SI para enviar o NO para cancelar."""
 def main():
     hilo = threading.Thread(target=run_health_server, daemon=True)
     hilo.start()
-    logger.info(f"Servidor health corriendo en puerto {PORT}")
-
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ayuda", ayuda))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_mensaje))
     logger.info("Bot corriendo...")
     app.run_polling()
