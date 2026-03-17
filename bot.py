@@ -5,7 +5,7 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from anthropic import Anthropic
+from groq import Groq
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_PASSWORD = os.environ["GMAIL_PASSWORD"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
@@ -45,10 +45,9 @@ ASUNTO: [asunto aquí]
 CUERPO:
 [cuerpo del mail aquí, terminando con "Nassim"]"""
 
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
+client = Groq(api_key=GROQ_API_KEY)
 
 
-# Servidor HTTP mínimo para que Render no cierre el proceso
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -56,7 +55,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot activo")
 
     def log_message(self, format, *args):
-        pass  # Silenciar logs del servidor HTTP
+        pass
 
 
 def run_health_server():
@@ -73,13 +72,15 @@ def generar_mail(nombre, email, empresa, rubro, notas, tono="creativo"):
 - Notas: {notas or 'ninguna'}
 - Tono solicitado: {tono}"""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ]
     )
-    return response.content[0].text
+    return response.choices[0].message.content
 
 
 def enviar_gmail(destinatario, asunto, cuerpo):
@@ -154,9 +155,7 @@ Para enviar un mail, mandame un mensaje con el formato:
 NOMBRE: Juan
 MAIL: juan@gym.com
 RUBRO: Fitness
-NOTAS: tiene un gym en Tucumán
-
-Te muestro el borrador y pregunto si lo enviás."""
+NOTAS: tiene un gym en Tucumán"""
 
     await update.message.reply_text(texto)
 
@@ -233,7 +232,7 @@ Asunto: {asunto}
 {FIRMA}
 
 ---
-Responde SI para enviar o NO para cancelar."""
+Respondé SI para enviar o NO para cancelar."""
 
         await update.message.reply_text(preview)
 
@@ -242,7 +241,6 @@ Responde SI para enviar o NO para cancelar."""
 
 
 def main():
-    # Arrancar servidor HTTP en hilo separado para que Render no mate el proceso
     hilo = threading.Thread(target=run_health_server, daemon=True)
     hilo.start()
     logger.info(f"Servidor health corriendo en puerto {PORT}")
